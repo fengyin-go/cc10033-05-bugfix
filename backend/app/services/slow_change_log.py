@@ -25,16 +25,8 @@ class SlowChangeLogService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
-        # 消费SCD处理结果
-        scd_msgs = store.channel.consume("scd.processing_result", "slow_change_log")
-        for msg in scd_msgs:
-            dim_code = msg["payload"]["dim_code"]
-            if dim_code == str(values.get("目标维度", "")):
-                values["变更原因"] = f"SCD策略执行: {msg['payload']['strategy_name']}"
-                values["变更字段"] = "SCD策略执行"
-                values["旧值"] = "执行前"
-                values["新值"] = msg["payload"]["result"].get("action", "已处理")
-
+        # 变更日志只登记实际写入的前后值；SCD 提交的日志由 scd_versioning 引擎
+        # 在确认落库成功后写入，这里不再从通道消息臆造旧值/新值。
         if not values.get("变更时间"):
             values["变更时间"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -56,6 +48,20 @@ class SlowChangeLogService(BaseModuleService):
             ["dim_definition", "scd_handler", "slow_change_log"],
         )
         return entry, []
+
+    def find_by_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        """按 SCD 批次ID回查该批实际写入的全部变更日志。"""
+        return [
+            row for row in store.rows(self.MODULE)
+            if str(row.get("批次ID", "")) == batch_id
+        ]
+
+    def find_by_dimension(self, dim_code: str) -> list[dict[str, Any]]:
+        """按维度回查变更链，定位失败时可据此找到原策略名再回查策略。"""
+        return [
+            row for row in store.rows(self.MODULE)
+            if str(row.get("目标维度", "")) == dim_code
+        ]
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry, message = super().run_action(entry_id, action)

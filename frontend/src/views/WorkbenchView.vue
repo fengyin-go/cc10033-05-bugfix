@@ -90,6 +90,11 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <ScdBatchPanel
+      v-if="meta.key === 'scd_handler' || meta.key === 'slow_change_log'"
+      :strategies="scdStrategies"
+    />
   </section>
 </template>
 
@@ -103,6 +108,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import ScdBatchPanel from '@/views/ScdBatchPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +121,7 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const scdStrategies = ref<EntryRow[]>([])
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -187,5 +194,19 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+async function loadScdStrategies() {
+  try {
+    const payload = await listEntries('scd_handler', {})
+    scdStrategies.value = payload.items
+  } catch {
+    scdStrategies.value = []
+  }
+}
+
+onMounted(() => {
+  void reload()
+  if (meta.key === 'scd_handler' || meta.key === 'slow_change_log') {
+    void loadScdStrategies()
+  }
+})
 </script>

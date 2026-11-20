@@ -325,6 +325,8 @@ class Store:
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()
         self.artifacts = ArtifactRegistry()
+        # SCD 提交台账：{批次ID: {维度编码: 当次处理结果}}，用于批次幂等与结果回放
+        self.scd_commits: dict[str, dict[str, dict[str, Any]]] = {}
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

@@ -114,6 +114,76 @@ class DimDefinitionService(BaseModuleService):
         base["channel_stats"] = store.channel.topic_stats().get("dim.defined", {})
         return base
 
+    def receive_scd_commit(self, commit: dict[str, Any]) -> dict[str, Any]:
+        """接收 SCD 处理服务的提交结果，更新维度定义的当前版本指针。
+
+        SCD2/6 已由落库引擎插入新版本行，这里只把维度当前版本元数据对齐到提交结果；
+        SCD1/3 不产生新行，当前版本号保持不变，但刷新来源批次与适用区间。
+        """
+        dim_code = str(commit.get("dim_code", ""))
+        current_row = None
+        for row in store.rows(self.MODULE):
+            if str(row.get("维度编码", "")) == dim_code and str(row.get("当前标记", "Y")) == "Y":
+                current_row = row
+                break
+        if current_row is None:
+            return {"dim_code": dim_code, "accepted": False, "reason": "维度当前版本不存在"}
+
+        new_version = commit.get("new_version")
+        current_row["当前版本号"] = new_version
+        current_row["上一版本号"] = commit.get("old_version")
+        current_row["版本生效时间"] = commit.get("effective_start", current_row.get("版本生效时间", ""))
+        current_row["版本失效时间"] = commit.get("effective_end", current_row.get("版本失效时间", ""))
+        current_row["生效时间"] = current_row["版本生效时间"]
+        current_row["失效时间"] = current_row["版本失效时间"]
+        current_row["当前标记"] = "Y"
+        current_row["current_marker"] = "1"
+        current_row["来源批次ID"] = commit.get("batch_id", "")
+        current_row["来源策略"] = commit.get("strategy_name", "")
+        attributes = commit.get("attributes") or {}
+        if attributes:
+            current_row["版本属性"] = "; ".join(f"{k}={v}" for k, v in attributes.items())
+
+        store.channel.publish("dim.scd_version_updated", {
+            "dim_code": dim_code,
+            "old_version": commit.get("old_version"),
+            "new_version": new_version,
+            "batch_id": commit.get("batch_id"),
+            "entry_id": current_row.get("id"),
+        })
+        return {
+            "dim_code": dim_code,
+            "accepted": True,
+            "current_version": new_version,
+            "current_row_id": current_row.get("id"),
+        }
+
+    def list_versions(self, dim_code: str) -> list[dict[str, Any]]:
+        """返回某维度的全部版本记录，按版本号升序，供工作台逐条核对处理结果。
+
+        尚未经历 SCD 提交的历史行没有版本字段，按 v1 当前版本补齐默认展示值，
+        不修改原始数据。
+        """
+        rows = [
+            row for row in store.rows(self.MODULE)
+            if str(row.get("维度编码", "")) == dim_code
+        ]
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            view = dict(row)
+            view.setdefault("当前版本号", 1)
+            view.setdefault("上一版本号", None)
+            view.setdefault("当前标记", "Y")
+            view.setdefault("current_marker", "1")
+            view.setdefault("版本生效时间", view.get("生效时间", ""))
+            view.setdefault("版本失效时间", view.get("失效时间", "9999-12-31 23:59:59"))
+            view.setdefault("版本属性", "")
+            view.setdefault("来源批次ID", "")
+            view.setdefault("来源策略", "")
+            normalized.append(view)
+        normalized.sort(key=lambda r: int(r.get("当前版本号", 1) or 1))
+        return normalized
+
 
 def _auto_associate_attributes(dim_code: str, dim_entry_id: int) -> None:
     """自动关联维度属性：为已存在的属性匹配到新发布的维度。"""

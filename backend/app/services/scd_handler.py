@@ -6,6 +6,7 @@
 - SCD类型3：保留原值和新值两列，支持当前值与上一值并存
 - 消费 dim.defined 和 attr.confirmed 通道消息
 - 变化检测基于MD5哈希，自动生成suggested策略
+- 启用策略时可携带属性变更批次，经 scd_versioning 引擎带乐观锁落库
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.scd_versioning import submit_scd_batch
 from app.store import store
 
 
@@ -92,27 +94,60 @@ class ScdHandlerService(BaseModuleService):
         )
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def submit_changes(self, entry_id: int, changes: list[dict[str, Any]],
+                       batch_id: str | None = None) -> tuple[dict[str, Any] | None, str]:
+        """提交属性变更批次：逐维度带乐观锁落库，返回同一份处理结果。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        if not changes:
+            return None, "变更批次为空，无可提交的属性变更"
+        outcome = submit_scd_batch(entry, changes, batch_id=batch_id)
+        store.channel.publish("scd.processing_result", {
+            "strategy_name": entry["策略名称"],
+            "dim_code": entry.get("目标维度", ""),
+            "scd_type": entry.get("SCD类型", ""),
+            "result": outcome,
+            "entry_id": entry_id,
+            "batch_id": outcome["batch_id"],
+        })
+        return outcome, "SCD变更批次已处理"
+
+    def run_action(self, entry_id: int, action: str,
+                   payload: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, str]:
         entry, message = super().run_action(entry_id, action)
         if entry is None:
             return None, message
 
+        payload = payload or {}
         scd_type = entry.get("SCD类型", "")
         dim_code = entry.get("目标维度", "")
 
         if action == "启用策略":
-            # 执行SCD处理模拟
-            result = _simulate_scd_processing(entry)
-            store.channel.publish("scd.processing_result", {
-                "strategy_name": entry["策略名称"],
-                "dim_code": dim_code,
-                "scd_type": scd_type,
-                "result": result,
-                "entry_id": entry_id,
-            })
-
-            # 创建日志变更记录
-            _log_scd_activation(dim_code, scd_type, entry["策略名称"])
+            changes = payload.get("changes")
+            if changes:
+                # 启用即提交：把当次属性变更真正落到维度版本记录
+                outcome = submit_scd_batch(entry, changes, batch_id=payload.get("batch_id"))
+                store.channel.publish("scd.processing_result", {
+                    "strategy_name": entry["策略名称"],
+                    "dim_code": dim_code,
+                    "scd_type": scd_type,
+                    "result": outcome,
+                    "entry_id": entry_id,
+                    "batch_id": outcome["batch_id"],
+                })
+                entry["最近处理批次"] = outcome["batch_id"]
+                entry["最近切换维度"] = ",".join(outcome["switched_dimensions"])
+            else:
+                # 无变更数据时仅发布策略级处理模拟，不写维度版本、不写变更日志
+                result = _simulate_scd_processing(entry)
+                store.channel.publish("scd.processing_result", {
+                    "strategy_name": entry["策略名称"],
+                    "dim_code": dim_code,
+                    "scd_type": scd_type,
+                    "result": result,
+                    "entry_id": entry_id,
+                })
 
         elif action == "停用策略":
             store.channel.publish("scd.strategy_deactivated", {
@@ -207,21 +242,3 @@ def _simulate_scd_processing(entry: dict[str, Any]) -> dict[str, Any]:
             "history_preserved": False,
             "new_rows_created": 0,
         }
-
-
-def _log_scd_activation(dim_code: str, scd_type: str, strategy_name: str) -> None:
-    """记录SCD策略启用日志到slow_change_log。"""
-    log_entry = {
-        "id": len(store.rows("slow_change_log")) + 1,
-        "status": "已记录",
-        "pending": True,
-        "abnormal": False,
-        "变更ID": f"SCD_ACT_{dim_code}_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
-        "目标维度": dim_code,
-        "变更字段": "SCD策略启用",
-        "旧值": "无",
-        "新值": strategy_name,
-        "变更时间": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "变更原因": f"SCD策略启用: {scd_type}",
-    }
-    store.insert("slow_change_log", log_entry)

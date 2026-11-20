@@ -29,3 +29,11 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+    # SCD 启用时可携带的属性变更批次与批次ID（幂等键）
+    changes: list[dict[str, Any]] | None = None
+    batch_id: str | None = None
+
+
+class ScdBatchPayload(BaseModel):
+    changes: list[dict[str, Any]]
+    batch_id: str | None = None
